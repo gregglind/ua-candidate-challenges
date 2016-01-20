@@ -37,6 +37,8 @@ We have given you a set of data that consists of the Heartbeat score and some Te
 * Describe whether the model you create is 'good'.
 * Suggest 'next steps'.
 
+See additional details in the `heartbeat_score_model/README.md`.
+
 For each of the minimum requirements, please provide justification for all analysis choices you made en route to your ultimate responses.
 
 ###Deliverable
