@@ -1,0 +1,470 @@
+---
+title: "User Advocacy Candidate Challenges"
+author: "Josh Gaunt"
+date: "January 20-25, 2016"
+output: 
+  html_document: 
+    number_sections: yes
+    toc: yes
+---
+---
+
+Upon receiving the email from Carla with [GitHub link to the exercises](https://github.com/gregglind/ua-candidate-challenges/), I cloned the repo to start a new [Rstudio](https://www.rstudio.org/) project. [R markdown](http://rmarkdown.rstudio.com/) of the narrative driving my analyses and all code I wrote/executed at each step was used to generate this formatted HTML output (I used Atom to edit out some distracting messages and remove empty space from outputs). I then saved the two challenges to separate R scripts in their final form without this commentary on their evolution. It may look like a lot altogether but the R scripts are succinct. The orderly writeup got pretty involved once I'd reached my conclusions. I added and committed all files to my local repo. Not being a contributor I belatedly forked the repo to my account, pushed my changes there, and submitted a pull request. I also replied to Carla's email with a link to my repo.
+
+---
+
+#User Feedback Data Analysis
+
+>You will find feedbackSample.csv in the ./input\_feedback\_data/ subdirectory.  It contains a raw dump of the English Input feedback for Firefox Desktop from 2015/12/06 to 2015/12/26.  This range includes the period in which Firefox 43 was released (2015/12/15).  **Your task is to consider whether there are any issues coming up that may be worth reporting to the relevant stakeholders.**  Note that new issues (e.g. spike in Flash crashes) are more relevant than existing large issues (e.g. steady levels of crashing complaints).
+
+##Refining Data Importation
+Getting a dataset imported properly can take a light touch - there are often subtle irregularities in data collection and processing routines that warrant attention and special handling. Also, the manner in which to treat variables requires critical thought. I iteratively refine my import, learning more about the data at each step until it appears usable to me.
+
+### First Import
+Focusing first on the Input data, I wanted to import and look them over quickly, as well as determine what datatypes R coerces the variables into by default (usually something inappropriate). When *description* and *user_agent* columns are omitted it's post-hoc and only for the sake of neater output.
+
+```{r set-options}
+# initialize all
+options(width = 110, "scipen"=999, "digits"=3, warn = -1)
+library(plyr)
+library(ggplot2)
+library(car)
+library(tm)
+library(SnowballC)
+library(wordcloud)
+library(cluster)
+library(ggdendro)
+library(MASS)
+library(party)
+
+# import, check summary and class for each variable
+d.input <- read.csv(paste(getwd(), "/input_feedback_data/feedbackSample.csv", sep=""))
+summary(d.input[,1:5])
+format(lapply(d.input, class))
+```
+
+N=`r nrow(d.input)` with `r ncol(d.input)` variables: *`r names(d.input)`*. All but one variable contains text, and as such are coerced by default to class factor.
+
+* *date* should be a POSIX datatype for any date computations
+* *happy*, the lone integer on this import, as a variable is categorical (although the `r sprintf("%.0f%%", mean(d.input$happy)*100)` average is meaningful - this subset of users predisposed to submitting feedback, when making this binary forced choice, often choose unhappy)
+* Not much variability in *browser*
+* *browser_version* and *platform* both make sense as factor
+* *user_agent* can be further decomposed with [ua-parser](https://github.com/ua-parser/uap-r) (although it would at cursory glance seem to be redundant with *browser, browser_version,* and *platform* columns)
+* *description* is an open-ended text field that should be a string/char datatype
+
+### Second Import With Manual Class Coercion
+
+Import again with the stringsAsFactors argument set to false, coerce classes manually, and check ranges and levels again.
+
+```{r}
+d.input <- read.csv(paste(getwd(), "/input_feedback_data/feedbackSample.csv", sep=""), stringsAsFactors=FALSE)
+# manually coerce classes
+d.input$date <- as.POSIXct(d.input$date, format = "%m/%d/%Y")
+d.input$browser <- factor(d.input$browser)
+d.input$browser_version <- factor(d.input$browser_version)
+d.input$platform <- factor(d.input$platform)
+
+summary(d.input[1:5], maxsum=15)
+```
+
+Date appears as it should and summary() gives it an appropriate range.
+
+### Third Import *(browser_version)*
+
+After consulting with the [release history](https://en.wikipedia.org/wiki/Firefox_release_history) it appears a very small number of old versions are in use and should be flagged. There is one case of version '43.0;' that should be included among the '43' level. If I add a column *verlen* for the length of the version string all cases but one of '40.0.3' have length==2 for the recent versions. If I correct that case to '40' I can split the cases on *verlen* and *browser_history* into a variable, *browser_cat*, to segregate browser_versions by "legacy," "pre-update", and "post-update". Again, I need to apply these corrections before factor coercion, which makes it difficult to coerce data back to integer or character values.
+
+```{r}
+d.input <- read.csv(paste(getwd(), "/input_feedback_data/feedbackSample.csv", sep=""), stringsAsFactors=FALSE)
+# correct irregular strings
+d.input$browser_version[d.input$browser_version=="43.0;"] <- "43"
+d.input$browser_version[d.input$browser_version=="40.0.3"] <- "40"
+d.input$browser_verlen <- nchar(d.input$browser_version)
+# collapse browser_version into 3 categories
+d.input$browser_cat <- character(length = nrow(d.input))
+d.input$browser_cat[d.input$browser_version >= 43] <- 'post-update'
+d.input$browser_cat[d.input$browser_version <  43] <- 'pre-update'
+d.input$browser_cat[d.input$browser_verlen > 2] <- 'legacy' # these versions have nchar 6, all recent have 2
+d.input$browser_cat <- factor(d.input$browser_cat)
+# manually coerce classes
+d.input$date <- as.POSIXct(d.input$date, format = "%m/%d/%Y")
+d.input$browser <- factor(d.input$browser)
+d.input$browser_version <- factor(d.input$browser_version)
+d.input$platform <- factor(d.input$platform)
+
+summary(d.input[c(1:5,8:9)], maxsum=15)
+```
+
+### Final Import *(platform)*
+
+I want to dig down into the platform level with an empty string "" for a label to see what's going on there:
+
+```{r}
+d.input[d.input$platform=="",1:6]
+```
+
+It's the Iceweasel user and the user_agent string indicates they're on Linux; although this lone observation doesn't wield much influence on the entire dataset I will correct the missing data in line with principle. Once again I import the data to apply these corrections prior to factor coercion. Lastly, I collapse *platform* into a new variable *platform_wide* by truncating as a 7 char string and putting Fedora into Linux to have the option to reduce the granularity of that variable. 
+
+```{r}
+d.input <- read.csv(paste(getwd(), "/input_feedback_data/feedbackSample.csv", sep=""), stringsAsFactors=FALSE)
+# correct missing platform string
+d.input$platform[d.input$platform==""] <- "Linux"
+d.input$platform <- factor(d.input$platform)
+# collapse platforms into wider vendor categories
+d.input$platform_wide <- strtrim(as.character(d.input$platform), 7)
+d.input$platform_wide[d.input$platform_wide=="Fedora"] <- "Linux"
+d.input$platform_wide <- factor(d.input$platform_wide)
+# correct irregular strings
+d.input$browser_version[d.input$browser_version=="43.0;"] <- "43"
+d.input$browser_version[d.input$browser_version=="40.0.3"] <- "40"
+d.input$browser_verlen <- nchar(d.input$browser_version)
+# collapse browser_version into 3 categories
+d.input$browser_cat <- character(length = nrow(d.input))
+d.input$browser_cat[d.input$browser_version >= 43] <- 'post-update'
+d.input$browser_cat[d.input$browser_version <  43] <- 'pre-update'
+d.input$browser_cat[d.input$browser_verlen > 2] <- 'legacy' # these versions have nchar 6, all recent have 2
+d.input$browser_cat <- factor(d.input$browser_cat)
+# manually coerce classes
+d.input$date <- as.POSIXct(d.input$date, format = "%m/%d/%Y")
+d.input$browser <- factor(d.input$browser)
+d.input$browser_version <- factor(d.input$browser_version)
+d.input$platform <- factor(d.input$platform)
+
+summary(d.input[c(1:5,8:10)], maxsum=15)
+```
+
+##Descriptive and Exploratory Analyses
+
+Now that the import has been finalized I can proceed to look at %*happy* by coarse factors and explore the time structure of the Input, perhaps to better target text analysis of the *description* variable. I first wanted to determine if the low mean of *happy* was invariant across factors or if it varies systematically. I prefer starting first with a broad perspective before expanding over more granular sublevels of a variable when it appears that a deeper pattern could be obscured.
+
+###Percent Happiness and Sample Sizes by *platform_wide* and *browser_cat*
+
+```{r}
+# sample sizes and %happy by browser_cat and platform_wide
+aggregate(happy ~ browser_cat + platform_wide, data = d.input, each(length,mean))
+```
+
+*happy.length* and *happy.mean* are the sample sizes and proportion of users reporting being happy. Clearly the majority of the sample uses a Windows platform, followed by OSX and Linux an order of magnitude lesser in number. Ignoring the small sample size groups (Android and legacy browser users) and focusing on happiness within platforms, it appears that users report less happiness after the 43 update. The increase in volume of submissions post-update is either a spike common to every update, or it is an indicator of urgency.
+
+```{r}
+# bar plot of %happy by browser_cat and platform_wide (excluding small groups)
+t.input <- d.input[d.input$platform_wide != 'Android',]
+t.input <- t.input[t.input$browser_cat != 'legacy',]
+ggplot(data=aggregate(happy ~ browser_cat + platform_wide, data = t.input, mean),
+       aes(x=platform_wide, y=happy, fill=browser_cat)) + 
+  geom_bar(stat="identity", position=position_dodge())
+```
+
+At a glance, Linux users appear happier than Windows users and OSX users, which could be the unhappiest. Is it relevant if  these differences are significant? A main effect of *browser_cat* would confirm less happiness after the update, which could signal a need to look deeper for short-term, "phasic" issues (as opposed to long-term, "tonic" issues). A main effect of *platform* upon happiness is less interesting when looking for problems arising from an update, whereas an interaction of it with  *browser_cat* could signal a bigger problem with one platform build than another following the update. I ran ANOVAs addressing these questions, with type III sums of squares to mitigate the unbalanced sample sizes.
+
+```{r}
+# 1-way ANOVA with type III SS
+Anova(lm(happy ~ browser_cat, data = t.input), type="3")
+# 2-way ANOVA with type III SS
+Anova(lm(happy ~ browser_cat*platform_wide, data = t.input), type="3")
+```
+
+There is a clear main effect of *browser_cat* in the one-way ANOVA; users on average are less happy following the update. The lack of interaction in the two-way ANOVA indicates this decrease in happiness is platform invariant, whereas the presence of a main effect for platform would indicate a significant difference in happiness between users on different platforms. Presently it does not seem pairwise comparisons on platform differences would address update-related problems, which is the focus. Noting the larger number of cases on Windows platforms, I wanted to dig down to the *platform* level for those.
+
+### Percent Happiness and Sample Sizes by *platform* and *browser_cat* **(Windows only)** 
+
+```{r}
+# sample sizes and %happy by browser_cat and platform (Windows only)
+aggregate(happy ~ browser_cat + platform, data = t.input[t.input$platform_wide=='Windows',], each(length,mean))
+ggplot(data=aggregate(happy ~ browser_cat + platform, data = t.input[t.input$platform_wide=='Windows',], mean),
+       aes(x=platform, y=happy, fill=browser_cat)) + 
+  geom_bar(stat="identity", position=position_dodge()) + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+There's only one user reporting Windows NT. Following the main pattern in less granular analyses, users are less happy post-update. There seems to be a big difference for Windows 8, although that is likely idiosyncratic noise due to smaller sample sizes; it is not as if a problem specific to the 77 users on that platform would be driving the main effect across platforms. Finding no sense of a deeper pattern here, I return to the less granular perspective but expand the data over *date*.
+
+### Percent Happiness by *platform* and *browser_cat* Over the *date* Range
+
+```{r}
+# plot %happy over days by browser_cat and platform_wide
+t.date <- aggregate(happy ~ date + browser_cat + platform_wide, data = t.input, mean)
+ggplot(t.date, aes(as.Date(date), happy)) + scale_x_date() + geom_line(aes(color = browser_cat)) + facet_grid(. ~ platform_wide) + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Even in the most collapsed state I could come up with, the data are rather noisy. One clear thing is some users submit feedback using beta versions prior to release; on Windows happiness is greater than zero for every day in the series, even for versions >= 43 before its release 12/15/2015. Following that date, though, a drop in happiness is most prominent on the Windows platform (that with the largest N). Presumably any actionable insight will come from comparing the results of text mining between the happy and unhappy users using pre and post update versions. Before proceeding it was useful for me to consider [what changed on that release](https://www.mozilla.org/en-US/firefox/43.0/releasenotes/).
+
+##Text Mining
+
+Cast *descriptions* into corpera for text mining with the **tm** package. While figuring out my approach I wrote some functions to handle common importing, preprocessing, and output tasks.
+
+```{r}
+f.impCorp <- function(x, whole= FALSE) {
+  # either collapse descriptions into one field or leave as many
+  if (whole) {
+    review_text <- paste(x, collapse=" ")  
+  } else {
+    review_text <- x  
+  }
+  # create vector source of descriptions, collect as corpus structure
+  review_source <- VectorSource(review_text)
+  corpus <- Corpus(review_source)
+}
+f.DTM <- function(corpus) {
+  # preprocess text corpus
+  corpus <- tm_map(corpus, removeNumbers)
+  corpus <- tm_map(corpus, removePunctuation)
+  corpus <- tm_map(corpus, tolower)
+  corpus <- tm_map(corpus, removeWords, stopwords("english"))
+  corpus <- tm_map(corpus, removeWords, c('firefox', 'mozilla','browser','yahoo','chrome'))
+  corpus <- tm_map(corpus, stemDocument)
+  corpus <- tm_map(corpus, stripWhitespace)
+  corpus <- tm_map(corpus, PlainTextDocument)
+  # create document term matrix from corpus
+  dtm <- DocumentTermMatrix(corpus)
+}
+f.wordCloud <- function(dtm, size= 20) {
+  # cast dtm to integer matrix, collapse over documents for sorted term sums
+  dtm2 <- as.matrix(dtm)
+  frequency <- colSums(dtm2)
+  frequency <- sort(frequency, decreasing=TRUE)
+  # get term char strings from sorted term count vector and plot word cloud
+  words <- names(frequency)
+  wordcloud(words[1:size], frequency[1:size], colors=brewer.pal(6, "Dark2"))
+}
+# organize each corpus to be analyzed
+d.manyCorpHpre <- f.impCorp(d.input$description[d.input$happy==1 & d.input$browser_cat=='pre-update'])
+d.manyDTMHpre <- f.DTM(d.manyCorpHpre)
+d.manyDTMHpre # Happy pre-update
+d.manyCorpHpost <- f.impCorp(d.input$description[d.input$happy==1 & d.input$browser_cat=='post-update'])
+d.manyDTMHpost <- f.DTM(d.manyCorpHpost)
+d.manyDTMHpost # Happy post-update
+d.manyCorpUpre <- f.impCorp(d.input$description[d.input$happy==0 & d.input$browser_cat=='pre-update'])
+d.manyDTMUpre <- f.DTM(d.manyCorpUpre)
+d.manyDTMUpre # Unhappy pre-update
+d.manyCorpUpost <- f.impCorp(d.input$description[d.input$happy==0 & d.input$browser_cat=='post-update'])
+d.manyDTMUpost <- f.DTM(d.manyCorpUpost)
+d.manyDTMUpost # Unhappy post-update
+```
+
+###Word Clouds
+
+Below are four word clouds, representing the 2x2 combination of *happy* and *browser_cat* as variables (see code comments to distinguish each once). The words vary in size by frequency, and the colors break to split the range. Although interesting there isn't much quantitative explanatory power in them. Moreover, some terms can be too big for the plot window and become excluded (warnings ignored here, but visible if running the stand-alone script).
+
+```{r}
+# happy word cloud pre-update
+f.wordCloud(d.manyDTMHpre, 40)
+# happy word cloud post-update
+f.wordCloud(d.manyDTMHpost, 40)
+# unhappy word cloud pre-update
+f.wordCloud(d.manyDTMUpre, 40)
+# unhappy word cloud post-update
+f.wordCloud(d.manyDTMUpost, 40)
+```
+
+###Happy Word Associations
+
+I looked for correlations in each of the four datasets greater than 0.4 between a vector of terms I intuitively thought other issue-related terms could be correlated with.
+
+```{r}
+t.corr <- 0.4
+# Happy pre-update term correlations
+findAssocs(d.manyDTMHpre, c("problem", "crash", "freez", "flash", "plugin", "bug", "ticket","addon","update","release"), corlimit=t.corr)
+```
+
+Terms like **httpssupportmozillaorgenusquestionsutmcampaignquestionsreplyutmmediumemailutmsourcenotification** being in the document-term matrix makes me think some users copy/paste technical error messages into Input, and some correlations could relate to the format of those. These responses are from happy pre-update responders, presumably the baseline of satisfied users with the inclination/awareness to use Input. Next I turn to happy responders post-update.
+
+```{r}
+# Happy post-update term correlations
+findAssocs(d.manyDTMHpost, c("problem", "crash", "freez", "flash", "plugin", "bug", "ticket","addon","update","release"), corlimit=t.corr)
+```
+
+Interesting associations (especially considering I'm under the impression *happy* == 1 are the smiley faces):
+
+* **flash** correlates with terms **leaks** and **sluggish** 
+* **plugin** correlates with **unorganized**
+* **bug** correlates with **sleep** and **httpsscontentcdninstagramcomhphotosxaftsxenjpg**
+
+I'm not sure how to interpret this - if they were unhappy submissions I would look at the plugin/addon UI/UX, whether flash would be crashing more than usual for some reason with the new update (triangulate via Telemetry?), or whether there could be a bug related to that specific code at instagram (maybe they could be using React in a way that affects Firefox). I don't feel like it's that likely, but perhaps the comments were saying thanks for fixing those things. Anything is possible, but not everything is likely.
+
+###Unhappy Word Associations
+
+Here is where I would expect to find important clues regarding what specific things are going wrong with Firefox and upsetting users. Both pre- and post-update associations are analyzed; novel associations in the latter could orient us to specific problems. Firstly, the pre-update data:
+
+```{r}
+# Unhappy pre-update term correlations
+findAssocs(d.manyDTMUpre, c("problem", "crash", "freez", "flash", "plugin", "bug", "ticket","addon","update","release"), corlimit=t.corr)
+```
+
+* I did a quick search on the words associated with **crash** to no avail
+* There seems to be discussion of **freez** (freeze, freezes, freezing, etc.) although the correlations of 1 to me suggest a low number of incidences
+* Users discuss **flash**, but not more specifically than name-dropping it
+* Similar but more extensive discussion of **plugin** as with happy users; **muting, live, and lag** associate with it now - perhaps problems with streaming software or sites tend to make users upset 
+* **bug** associates with **localstorerdf** which has a specific, and technical look to me on a gut level (admittedly not always the best criterion)
+* **ticket** associates with **inspiron** - has Dell released a new line?
+
+Comparing these associations with the next dataset could reveal novel issues arising with the update.
+
+```{r}
+# Unhappy post-update term correlations
+findAssocs(d.manyDTMUpost, c("problem", "crash", "freez", "flash", "plugin", "bug", "ticket","addon","update","release"), corlimit=t.corr)
+```
+
+* **freez*** associates with **gifaround**, **jpeg**, and **messagefirefo** - not sure how to interpret that
+* **plugin** associates with **container**, a background process facilitating plugin operation
+
+Unfortunately so far I am left without strong quantitative cues into the cause of the increase in unhappy Input. In hindsight I'd like quite a bit more time to go over descriptions to influence my concept of terms to search for correlations with, link particular multi-word phrases in the corpus, find a way to cope with typos, parse copy/pasted feedback that was auto-generated by Firefox, and definitely figure out a better way to visualize the associations.
+
+### Clustering Analyses
+
+Perhaps hierarchical clustering can provide stronger insight. Here I discard the happy data and focus on the difference between pre and post update users submitting unhappy data. Word similarity can be represented with distance metrics and clustered. I compute distances for unhappy data pre/post-update, fit each to hierarchical cluster models, and plot them. Terms of high enough similarity for inclusion appear on the x-axis, the distance/similarity metric on the y-axis (note that the plots are transposed to orient the text legibly).
+
+```{r}
+# thin the DTMs, otherwise it runs excessively long
+t.manyDTMUpre <- removeSparseTerms(d.manyDTMUpre, 0.95)
+t.manyDTMUpost <- removeSparseTerms(d.manyDTMUpost, 0.95)
+
+# compute distances
+d.distUpre <- dist(t(t.manyDTMUpre), method="euclidian")   
+d.distUpost <- dist(t(t.manyDTMUpost), method="euclidian")   
+
+# hierarchical clustering
+m.hcUpre <- hclust(d=d.distUpre, method="ward.D2")   
+m.hcUpost <- hclust(d=d.distUpost, method="ward.D2")   
+
+# Unhappy pre-update hc dendrogram
+ggdendrogram(m.hcUpre, rotate = TRUE, size = 4, theme_dendro = FALSE, color = "tomato")
+# Unhappy post-update hc dendrogram
+ggdendrogram(m.hcUpost, rotate = TRUE, size = 4, theme_dendro = FALSE, color = "tomato")
+```
+
+The relationships are visually obscure, but there are similar and dissimilar clusters in the two plots. That is, both feature a cluster containing terms **problem** and **using**, another with **now, every, time, dont, like, want** and contrarily there are term clusters in only the post-update cluster plot not present in the pre-update. **toolbar** is a novel term post-update, another cluster contains terms **disabled** and **addon**. Perhaps particular addon/plugins were disabled with the update, or there's problems with a toolbar. With ample time I could write an algorithm to compare the clusters across the models for similarity and novelty to express it quantitatively. I suppose that could be a good starting point for determining associative terms: Finding novel clusters in post-update Input feedback and then searching liberally (with a low correlation criterion) for terms that associate with terms in those clusters - 'disabled plugin' as a phrase, for instance.
+
+## Conclusions
+
+These data indicate that there is something about the update that causes an influx of unhappy Input feedback. What particular issues there are that cause happiness to be significantly lesser following the release I cannot say with certainty. Although the text mining analyses and visalizations provide fodder for consideration, I cannot in the time and quantity of data allotted quantitatively narrow down any "smoking gun(s)". As such, it is difficult to say whether the main effect of *browser_cat* on happiness is not something unique to this update, but to most updates in general. That is, maybe every time there's an update there's, to some degree, a standard sounding off from the unhappy. 
+
+I don't feel I exhausted all avenues of approach, but it would take more research on techniques as well as a more thorough cleaning of the data pending discussion with others who know the data better than myself (maybe someone has regex to search for copy/pasted crash dumps or something of the like). With more time associative terms could be refined thoughtfully and targeted to each release. Also, I can think of a few ways to revise Input in hopes of receiving more targeted feedback. Also, examining the history of other updates via Input could provide a basis for establishing how discontent over an update compares from one to the next. Lastly, once a better targeted set of associative search terms has been curated it could be translated across languages to incorporate any looming sample size from non-English users.
+
+---
+
+#User Rating / Config Data Analysis
+>We have given you a set of data that consists of the Heartbeat score and some Telemetry covariates in the ./heartbeat\_score\_model/ subdirectory. **Evaluate the following claim: Heartbeat Score (self-reported "Please Rate Firefox") is related to other measurable aspects of the Firefox experience.** For each of the minimum requirements, please provide justification for all analysis choices you made en route to your ultimate responses.
+
+##Importing Data, Looking at Descriptives
+
+Proceeding along similar lines as with the first analysis, I make myself familiar with the data and get it into shape. For brevity I omit the succession of steps for exercise 2. Once again I manually coerced many variables to factor, corrected the date/time class, and tossed a few string variants on yahoo search engine in with the rest of them.
+
+```{r}
+# import csv 
+d.hb <- read.csv(paste(getwd(), "/heartbeat_score_model/heartbeat_score_model.csv", sep=""), stringsAsFactors = FALSE)
+# coerce factors manually
+d.hb$channel <- factor(d.hb$channel)
+d.hb$locale <- factor(d.hb$locale)
+d.hb$searchEngine[d.hb$searchEngine == 'yahoo-en-GB'] <- 'yahoo'
+d.hb$searchEngine[d.hb$searchEngine == 'yahoo-web'] <- 'yahoo'
+d.hb$searchEngine <- factor(d.hb$searchEngine)
+d.hb$series <- factor(d.hb$series)
+d.hb$version <- factor(d.hb$version)
+# coerce to POSIX
+d.hb$received <- as.POSIXct(d.hb$received, format = "%Y-%m-%d %H:%M:%S")
+# display summary and classes
+summary(d.hb, maxsum=15)
+format(lapply(d.hb, class))
+```
+
+N=`r nrow(d.hb)` with `r ncol(d.hb)` variables: *`r names(d.hb)`*. The averages of those integers representing Telemetry metrics in the summary above indicate only a miniscule number of users have clockSkew, about 70% use Firefox as their default browser, only 22% have activated Do Not Track headers, 83% have Flash installed, 42% have Silverlight installed, and 15% use a non-included search engine. Most measurements are from the US locale. Most users use google as their search engine, followed second by the 'other' category. Data were received between 2015-11-28 and 2015-12-15 (date of 43 update). 
+
+```{r}
+# channel table
+t.channel <- aggregate(rep(1, nrow(d.hb)) ~ channel, data = d.hb, sum)
+t.channel$prop <- t.channel[,2] / sum(t.channel[,2])
+names(t.channel) <- c('channel','N','prop')
+t.channel[order(-t.channel$N),]
+```
+
+Looking at *channel*,  'beta' respondents outnumber those in the 'release' category, followed by 'aurora' and then 'nightly' users. Intuitively, I would not expect 'beta' to be the most numerous in terms of the overall population of users, but assuming random sampling I wouldn't be surprised if they outnumber 'release' users in this table because of a greater response rate, perhaps 'beta' users feel a sense of duty to opt-in. I'd have to see the number of prompts vs. submissions by *channel* to be certain.
+
+```{r}
+# series x channel table
+t.series <- aggregate(rep(1, nrow(d.hb)) ~ channel + series, data = d.hb, sum)
+names(t.series) <- c('channel','series','N')
+t.series[order(-t.series$N),]
+```
+
+Version-wise most respondents are as up-to-date as they can be in their respective channels. Not surprising to see far smaller contributions to the sample from older series browsers. 
+
+All variables of class integer are ordinal or categorical in nature. I left them as integer in d.hb and coerced all of them but *score* in an alternate data.frame d.alt. Taking a hint from the heartbeat_score_model/README.md I excluded some variables from the analysis. *version* appears noisy, with most measurements coming from non-incremental releases, whereas series appears distributed unimodally around 43. *received* as well as *locale* seem like metadata unrelated to addressing the question - although measureable they aren't aspects of the Firefox experience, per se. I refine the data.frame and plot the score counts across all variables.
+
+```{r}
+# coerce alternate df with integers to factor
+d.alt <- d.hb
+d.alt$clockSkewed <- factor(d.hb$clockSkewed)
+d.alt$defaultBrowser <- factor(d.hb$defaultBrowser)
+d.alt$dnt <- factor(d.hb$dnt)
+d.alt$hasFlash <- factor(d.hb$hasFlash)
+d.alt$silverlight <- factor(d.hb$silverlight)
+d.alt$usingNonIncludedSearchEngine <- factor(d.hb$usingNonIncludedSearchEngine)
+d.alt <- subset(d.alt, select=c(-received, -version, -locale)) 
+summary(d.alt, maxsum=15)
+
+# plot all scores
+plot(ordered(d.hb$score))
+```
+
+The distribution skews heavily toward 5-star ratings. Most users rate their experience very highly. Although this is good on its face, it implies a limit in variability that can distinguish different qualities of experience by modeling.
+
+## Modeling
+
+> Explain SCORE using other covariates... Justify data analysis choices... Identify those covariates that are better for predicting scores...
+
+### Ordered Logistic Regression
+
+The *score* variable should not be analyzed as class integer; it is not interval or ratio scaled - it is ordinal. I coerce them ad-hoc for prediction in an ordered logistic regression model (polr() function from package **MASS**) using the remaining Telemetry variables as predictors. The output includes t-values, which I pass to a function to determine the presented p-values. The model automatically dummy codes the sublevels of each factor and drops coefficients for any that covary strongly with another (they tend to be those with smallest sample size). The Hess=TRUE argument returns output necessary to execute summary(). I preliminary analyses indicate *searchEngine* washed out the lone effect of *usingNonIncludedSearchEngine*, so I dropped it from the model - presumably they covary and the latter ends up being the interesting factor.
+
+```{r}
+f.pVal <- function(x) {
+  # table coefficients etc., calculate odds and p values, and combine
+  t.ctable <- coef(summary(x))
+  t.odds <- exp(t.ctable[, "Value"])
+  t.p <- pnorm(abs(t.ctable[, "t value"]), lower.tail = FALSE) * 2
+  t.ctable <- cbind(t.ctable, "odds" = t.odds, "p value" = t.p)
+}
+# ordered logistic regression model
+m.polr <- polr(ordered(score) ~ channel + clockSkewed + defaultBrowser + dnt + hasFlash + series + silverlight + usingNonIncludedSearchEngine, data = d.alt, Hess=TRUE)
+print(t.ctable <- f.pVal(m.polr))
+```
+
+No coefficients needed to be dropped from the model. Coefficients in an ordinal logistic model vary in direction and magnitude. The negative sign for the significant (p < .05) effect of *usingNonIncludedSearchEngine1* indicates that when users use a search engine under 'other' they're more likely to respond with a lower *score*. More specifically this is a proportional odds model where exp(coefficient) is an odds ratio. In this case, those using one of those search engines is 0.76 times more likely to rate their experience with less stars. No other coefficients were significant in predicting Heartbeat *score*.
+
+### Ctree Classification
+
+Heuristically (mostly from experience), when I feel like regression analyses don't reveal many effects I turn to classification on the presumption there's a non-linear pattern in the data that eludes regression. I prefer the ctree algorithm from the **party** package for partitioning/classification. Algorithms like CART rely on maximizing information measures to select splitting variables and values, whereas ctree performs iterative univariate significance tests to determine splits. I used the same variable formula here as with the regression analysis to retain comparability.
+
+```{r}
+# ctree classification model
+m.ctree <- ctree(ordered(score) ~ channel + clockSkewed + defaultBrowser + dnt + hasFlash + series + silverlight + usingNonIncludedSearchEngine, data=d.alt)
+plot(m.ctree)
+```
+
+There are four terminal nodes in this classification, each predicting the response distribution and summing to 100% probability. There are subtle but significant differences between the Heartbeat scores depending on *channel*, which splits the data twice. All beta users reside in node 7, and all nightly and release users in node 6, meaning only aurora users were split on *usingNonIncludedSearchEngine* in node 2. Regression analysis washed out these effects.
+
+The difference between nodes 4 and 5 echoes the finding from the ordered logit analysis - there are less 5 star ratings in the class split on 1 for *usingNonIncludedSearchEngine*. Repeating the analysis after taking out the strongest variable *channel*, leads to a single split on *series* with all but 44 and 45 in node 5 and the remaining cases in node 2 to be split on *usingNonIncludedSearchEngine* into nodes 3 and 4. Running ctree once more without *series* leads to a binary "stump" tree split only on *usingNonIncludedSearchEngine*, which is apparently the only reliable effect in the data set.
+
+```{r}
+m.ctree <- ctree(ordered(score) ~ clockSkewed + defaultBrowser + dnt + hasFlash + series + silverlight + usingNonIncludedSearchEngine, data=d.alt)
+plot(m.ctree)
+m.ctree <- ctree(ordered(score) ~ clockSkewed + defaultBrowser + dnt + hasFlash + silverlight + usingNonIncludedSearchEngine, data=d.alt)
+plot(m.ctree)
+```
+
+## Conclusions
+
+> Describe whether the model you create is 'good'... Write up repeatable analysis... Suggest 'next steps'...
+
+According to the analyses I performed, *usingNonIncludedSearchEngine* is the only variable in these data related to self-reported Heartbeat *score*, and I'd wager there's something deeper about it driving the effect. The 329 cases (15% of the sample) where *usingNonIncludedSearchEngine* == 1 have a tendency to rate their experience with less stars, and that tendency seems to vary as a function of *channel* and *series* rather than indiosyncratic technical things like whether they have flash or silverlight installed. I would hesitate to describe the models I've created as "good" in that they don't seem to afford much more than vague suggestions. However, they were technically appropriate, so if the data indicate only one variable relates to Heartbeat *score* there's nothing "bad" about the models. It would be nice if they could provide more actionable insights, of course.
+
+Although the models I chose were compatible with the types and scales of variables present in the data, looking for better techniques would be among the next steps I would take. Something that could cope with the multicollinearity of *searchEngine* and *usingNonIncludedSearchEngine* could afford the latter inclusion in the model along with the former. Also, I wonder if it is possible to include more Telemetry variables in the hopes they have more predictive power. If one were to take seriously the one significant result of this analysis I would try to dig down into what these 'other' search engines are and how either Firefox could be made to play nicer with them or whether Mozilla could provide more accessible or clearer guidelines to developers of search plugins to ensure their work remains compatible.
+
+---
+
+# General Conclusions
+
+It makes sense (and it's a bit amusing) that the two routes of user input seem to diverge so strongly. On the one hand, Input is convenience sampled, so anyone with the inclination to provide feedback that knows the feature exists can use it to let you know what they think. Casually browsing some of the *descriptions* it could seem that some of those people really want to let you know they aren't happy. Contrarily, although Heartbeat is not without its one and two star ratings, the overwhelming majority of users, provide positive reviews. It is qualitative conjecture, but considering that Input is prone to selection bias whereas Heartbeat is randomly inclusive, perhaps most users are generally happy with their experience. The 5,335 unhappy users in the Input sample would make up ~1% of a population of a half-million but I'm skeptical they're an unbiased representation of it. I'm aware the Heartbeat data I have cut off around the time 43 was released. It's an empirical question whether Heartbeat scores would decrease following that official update release, although most of the Heartbeat respondents were using 43 or later already so probably not.
+
+*Anecdotally,* I myself have used Firefox over 10 years and didn't know of Input until my phone-screenings. There's been times I wanted to provide feedback but I managed to miss out on the feature, or perhaps it wasn't available then. Imagining myself engaging with Input now that I've seen the data, I'm not sure how I would format my feedback or whether I would produce one long submission or several short ones.
+
+Thanks for providing me some data to ponder and the opportunity to present some basic, preliminary findings to you.
